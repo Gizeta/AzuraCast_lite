@@ -1,0 +1,413 @@
+From d0fe97cb9a54ababf8372d921169aab1c992670f Mon Sep 17 00:00:00 2001
+From: Gizeta <i@gizeta.me>
+Date: Fri, 31 Oct 2025 13:38:32 +0800
+Subject: [PATCH] change to icecast-metadata-player
+
+---
+ .../components/Common/Audio/AudioPlayer.vue   |  55 +++++++
+ frontend/functions/useNowPlaying.ts           |  31 ++++
+ package-lock.json                             | 147 ++++++++++++++++++
+ package.json                                  |   1 +
+ 4 files changed, 234 insertions(+)
+
+diff --git a/frontend/components/Common/Audio/AudioPlayer.vue b/frontend/components/Common/Audio/AudioPlayer.vue
+index 98e14ac17..7c4a424b8 100644
+--- a/frontend/components/Common/Audio/AudioPlayer.vue
++++ b/frontend/components/Common/Audio/AudioPlayer.vue
+@@ -12,6 +12,7 @@ import {nextTick, onMounted, onScopeDispose, ref, useTemplateRef, watch} from "v
+ import {usePlayerStore} from "~/functions/usePlayerStore.ts";
+ import {storeToRefs} from "pinia";
+ import {isString} from "es-toolkit/compat";
++import IcecastMetadataPlayer from "icecast-metadata-player";
+ 
+ const playerStore = usePlayerStore();
+ const {logVolume, isMuted, isPlaying, current, duration, progress} = storeToRefs(playerStore);
+@@ -22,16 +23,59 @@ const $audio = useTemplateRef('$audio');
+ const hls = ref<Hls | null>(null);
+ const bc = ref<BroadcastChannel | null>(null);
+ 
++const { setDuration, setCurrentTime } = playerStore;
++
++let icePlayer;
++function getIcePlayer(url = '') {
++    return new IcecastMetadataPlayer(url, {
++        metadataTypes: ["ogg"],
++        retryTimeout: 5,
++        onMetadata(metadata) {
++            document.dispatchEvent(new CustomEvent("icy-metadata-update", {
++                detail: {
++                    title: metadata.TITLE || '',
++                    album: metadata.ALBUM || '',
++                    artist: metadata.ARTIST || '',
++                    genre: metadata.GENRE || ''
++                }
++            }));
++        },
++        onLoad() {
++            icePlayer.audioElement.volume = logVolume.value;
++            icePlayer.audioElement.muted = isMuted.value;
++            setDuration(0);
++        },
++        onStreamEnd() {
++            stop();
++        },
++        onError() {
++            console.log('Network interrupted stream. Automatically reconnecting shortly...');
++            setTimeout(() => {
++                play();
++            }, 5000);
++        },
++        onCodecUpdate: (_, updateTimestamp) => {
++            setCurrentTime(updateTimestamp);
++        },
++    } as any);
++}
++
+ watch(logVolume, (newVol) => {
+     if ($audio.value !== null) {
+         $audio.value.volume = newVol;
+     }
++    if (icePlayer.audioElement !== null) {
++        icePlayer.audioElement.volume = newVol;
++    }
+ });
+ 
+ watch(isMuted, (newMuted) => {
+     if ($audio.value !== null) {
+         $audio.value.muted = newMuted;
+     }
++    if (icePlayer.audioElement !== null) {
++        icePlayer.audioElement.muted = newMuted;
++    }
+ });
+ 
+ const stop = () => {
+@@ -39,6 +83,9 @@ const stop = () => {
+         $audio.value.pause();
+         $audio.value.src = '';
+     }
++    if (icePlayer.state !== 'stopping' && icePlayer.state !== 'stopped') {
++        icePlayer.stop();
++    }
+ 
+     if (hls.value !== null) {
+         hls.value.destroy();
+@@ -110,6 +157,7 @@ const play = () => {
+                 }
+             } else {
+                 // Standard streams
++                /*
+                 $audio.value.src = current.value.url;
+ 
+                 // Firefox caches the downloaded stream, this causes playback issues.
+@@ -117,11 +165,18 @@ const play = () => {
+                 if (navigator.userAgent.includes("Firefox")) {
+                     $audio.value.src += "?refresh=" + Date.now();
+                 }
++                */
++                icePlayer = getIcePlayer(`${current.value.url}${navigator.userAgent.includes("Firefox") ? `?refresh=${Date.now()}` : ''}`);
+             }
+         }
+ 
++        if ($audio.value.src) {
+         $audio.value.load();
+         $audio.value.play();
++        }
++        if (icePlayer) {
++            icePlayer.play();
++        }
+ 
+         if (bc.value) {
+             bc.value.postMessage('played');
+diff --git a/frontend/functions/useNowPlaying.ts b/frontend/functions/useNowPlaying.ts
+index 627d25c2d..b6890003a 100644
+--- a/frontend/functions/useNowPlaying.ts
++++ b/frontend/functions/useNowPlaying.ts
+@@ -6,6 +6,8 @@ import {getApiUrl} from "~/router.ts";
+ import {useAxios} from "~/vendor/axios.ts";
+ import formatTime from "~/functions/formatTime.ts";
+ import {isUndefined, omitBy} from "es-toolkit/compat";
++import {useEventListener} from "@vueuse/core";
++import {ApiNowPlayingStation} from "~/entities/ApiInterfaces.ts";
+ 
+ interface SsePayload {
+     data: {
+@@ -169,6 +171,7 @@ export default function useNowPlaying(
+                     }
+                 };
+ 
++                /*
+                 const {
+                     pause: pauseNp,
+                     resume: resumeNp,
+@@ -212,6 +215,34 @@ export default function useNowPlaying(
+                         }
+                     }
+                 )
++                */
++
++                (async function () {
++                    const stationUri = getApiUrl(`/station/${settings.stationShortName}`);
++                    const {data} = await axiosSilent.get<ApiNowPlayingStation>(stationUri.value, axiosNoCacheConfig);
++                    setNowPlaying({
++                        ...(np.value!),
++                        station: data,
++                    });
++                })();
++
++                useEventListener(document, "icy-metadata-update", (evt: CustomEvent) => {
++                    setNowPlaying({
++                        ...(np.value!),
++                        is_online: true,
++                        now_playing: {
++                            ...(np.value.now_playing!),
++                            song: {
++                                ...(np.value.now_playing!.song!),
++                                text: `${evt.detail.artist} - ${evt.detail.title}`,
++                                artist: evt.detail.artist,
++                                title: evt.detail.title,
++                                album: evt.detail.album,
++                                genre: evt.detail.genre
++                            }
++                        }
++                    });
++                });
+             }
+ 
+             useIntervalFn(
+diff --git a/package-lock.json b/package-lock.json
+index 489a5dd67..156e79ee0 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -31,6 +31,7 @@
+         "codemirror-lang-liquidsoap": "^0.4",
+         "es-toolkit": "^1.39.10",
+         "hls.js": "^1.1.5",
++        "icecast-metadata-player": "^1.17.13",
+         "leaflet": "^1.7.1",
+         "leaflet-fullscreen": "^1.0.2",
+         "luxon": "^3",
+@@ -921,6 +922,12 @@
+         "node": ">=18"
+       }
+     },
++    "node_modules/@eshaz/web-worker": {
++      "version": "1.2.2",
++      "resolved": "https://registry.npmmirror.com/@eshaz/web-worker/-/web-worker-1.2.2.tgz",
++      "integrity": "sha512-WxXiHFmD9u/owrzempiDlBB1ZYqiLnm9s6aPc8AlFQalq2tKmqdmMr9GXOupDgzXtqnBipj8Un0gkIm7Sjf8mw==",
++      "license": "Apache-2.0"
++    },
+     "node_modules/@eslint-community/eslint-utils": {
+       "version": "4.9.0",
+       "resolved": "https://registry.npmjs.org/@eslint-community/eslint-utils/-/eslint-utils-4.9.0.tgz",
+@@ -2942,6 +2949,44 @@
+         "vue": "^3.5.0"
+       }
+     },
++    "node_modules/@wasm-audio-decoders/common": {
++      "version": "9.0.7",
++      "resolved": "https://registry.npmmirror.com/@wasm-audio-decoders/common/-/common-9.0.7.tgz",
++      "integrity": "sha512-WRaUuWSKV7pkttBygml/a6dIEpatq2nnZGFIoPTc5yPLkxL6Wk4YaslPM98OPQvWacvNZ+Py9xROGDtrFBDzag==",
++      "license": "MIT",
++      "dependencies": {
++        "@eshaz/web-worker": "1.2.2",
++        "simple-yenc": "^1.0.4"
++      }
++    },
++    "node_modules/@wasm-audio-decoders/flac": {
++      "version": "0.2.8",
++      "resolved": "https://registry.npmmirror.com/@wasm-audio-decoders/flac/-/flac-0.2.8.tgz",
++      "integrity": "sha512-CxvylHiUmtCrf0hUSzYQlD9RtoY/LsPuKR8M6ZjtQrXHzSLir0whWjPs1yb+hDZdK8R1NbESHcz2ZV88eMcKUg==",
++      "license": "MIT",
++      "dependencies": {
++        "@wasm-audio-decoders/common": "9.0.7",
++        "codec-parser": "2.5.0"
++      },
++      "funding": {
++        "type": "individual",
++        "url": "https://github.com/sponsors/eshaz"
++      }
++    },
++    "node_modules/@wasm-audio-decoders/ogg-vorbis": {
++      "version": "0.1.18",
++      "resolved": "https://registry.npmmirror.com/@wasm-audio-decoders/ogg-vorbis/-/ogg-vorbis-0.1.18.tgz",
++      "integrity": "sha512-kEg6b5vW4wAXfGAqe5wzvSuAs2FEhPY/rniYF/Gx3rgxQcPiRI86SBAyIRWFJ7O4CY/JJHX57B1OCDueMlBSLQ==",
++      "license": "MIT",
++      "dependencies": {
++        "@wasm-audio-decoders/common": "9.0.7",
++        "codec-parser": "2.5.0"
++      },
++      "funding": {
++        "type": "individual",
++        "url": "https://github.com/sponsors/eshaz"
++      }
++    },
+     "node_modules/acorn": {
+       "version": "8.15.0",
+       "resolved": "https://registry.npmjs.org/acorn/-/acorn-8.15.0.tgz",
+@@ -3368,6 +3413,12 @@
+         "node": ">=8"
+       }
+     },
++    "node_modules/codec-parser": {
++      "version": "2.5.0",
++      "resolved": "https://registry.npmmirror.com/codec-parser/-/codec-parser-2.5.0.tgz",
++      "integrity": "sha512-Ru9t80fV8B0ZiixQl8xhMTLru+dzuis/KQld32/x5T/+3LwZb0/YvQdSKytX9JqCnRdiupvAvyYJINKrXieziQ==",
++      "license": "LGPL-3.0-or-later"
++    },
+     "node_modules/codemirror": {
+       "version": "6.0.2",
+       "resolved": "https://registry.npmjs.org/codemirror/-/codemirror-6.0.2.tgz",
+@@ -4738,6 +4789,39 @@
+         "node": ">= 14"
+       }
+     },
++    "node_modules/icecast-metadata-js": {
++      "version": "1.2.9",
++      "resolved": "https://registry.npmmirror.com/icecast-metadata-js/-/icecast-metadata-js-1.2.9.tgz",
++      "integrity": "sha512-8YqPrJ4AjM64O28xF9TSUUFczxnTKwXwnIPmZKRxdbaZb6hn0nP+ke1OGNA+UsIfLpNRW4acDDBkIkbynYVQig==",
++      "license": "LGPL-3.0-or-later",
++      "dependencies": {
++        "codec-parser": "2.5.0"
++      },
++      "funding": {
++        "type": "individual",
++        "url": "https://github.com/sponsors/eshaz"
++      }
++    },
++    "node_modules/icecast-metadata-player": {
++      "version": "1.17.13",
++      "resolved": "https://registry.npmmirror.com/icecast-metadata-player/-/icecast-metadata-player-1.17.13.tgz",
++      "integrity": "sha512-rI1gdxX70egQtuoHrMN7f1dtvY6hJOoGLNZvC39N9WYw6buXwDB15OSj0uccjFjrg7tHhMxRc52s7kNHwvcfDg==",
++      "license": "LGPL-3.0-or-later",
++      "dependencies": {
++        "@wasm-audio-decoders/flac": "0.2.8",
++        "@wasm-audio-decoders/ogg-vorbis": "0.1.18",
++        "codec-parser": "2.5.0",
++        "icecast-metadata-js": "1.2.9",
++        "mpg123-decoder": "1.0.2",
++        "mse-audio-wrapper": "1.4.15",
++        "opus-decoder": "0.7.10",
++        "synaudio": "0.4.0"
++      },
++      "funding": {
++        "type": "individual",
++        "url": "https://github.com/sponsors/eshaz"
++      }
++    },
+     "node_modules/iconv-lite": {
+       "version": "0.6.3",
+       "resolved": "https://registry.npmjs.org/iconv-lite/-/iconv-lite-0.6.3.tgz",
+@@ -5265,6 +5349,19 @@
+         "pathe": "^2.0.1"
+       }
+     },
++    "node_modules/mpg123-decoder": {
++      "version": "1.0.2",
++      "resolved": "https://registry.npmmirror.com/mpg123-decoder/-/mpg123-decoder-1.0.2.tgz",
++      "integrity": "sha512-cw0Laz57gumQsfCqnNeGtgq64EcyrK/z4qx+kq4iba7iSSXfI7uO3jiHjdHxNp4PB2v08VZYZ2Fr68VM1JkaPQ==",
++      "license": "MIT",
++      "dependencies": {
++        "@wasm-audio-decoders/common": "9.0.7"
++      },
++      "funding": {
++        "type": "individual",
++        "url": "https://github.com/sponsors/eshaz"
++      }
++    },
+     "node_modules/ms": {
+       "version": "2.1.3",
+       "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+@@ -5272,6 +5369,19 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/mse-audio-wrapper": {
++      "version": "1.4.15",
++      "resolved": "https://registry.npmmirror.com/mse-audio-wrapper/-/mse-audio-wrapper-1.4.15.tgz",
++      "integrity": "sha512-JsMxe4CY8Eu6yXyz4K9/tqK/Lq6g7UxeFCZ9zpRtzDTDb2KmKQPhNbeySgH1+TqTZZBmRdHNYJ9Pv4Rpq9YNYw==",
++      "license": "LGPL-3.0-or-later",
++      "dependencies": {
++        "codec-parser": "2.5.0"
++      },
++      "funding": {
++        "type": "individual",
++        "url": "https://github.com/sponsors/eshaz"
++      }
++    },
+     "node_modules/muggle-string": {
+       "version": "0.4.1",
+       "resolved": "https://registry.npmjs.org/muggle-string/-/muggle-string-0.4.1.tgz",
+@@ -5681,6 +5791,19 @@
+         "node": ">= 0.8.0"
+       }
+     },
++    "node_modules/opus-decoder": {
++      "version": "0.7.10",
++      "resolved": "https://registry.npmmirror.com/opus-decoder/-/opus-decoder-0.7.10.tgz",
++      "integrity": "sha512-qUZdyAK+kKy/wUSd/oZ0ULE9U/yskp332n2oBvSP/Jz/wHsHiVRg33f/tRUR8TRiw+ka7AQUclxcr5TbUJo+VA==",
++      "license": "MIT",
++      "dependencies": {
++        "@wasm-audio-decoders/common": "9.0.7"
++      },
++      "funding": {
++        "type": "individual",
++        "url": "https://github.com/sponsors/eshaz"
++      }
++    },
+     "node_modules/p-limit": {
+       "version": "3.1.0",
+       "resolved": "https://registry.npmjs.org/p-limit/-/p-limit-3.1.0.tgz",
+@@ -6402,6 +6525,16 @@
+         "url": "https://github.com/sponsors/isaacs"
+       }
+     },
++    "node_modules/simple-yenc": {
++      "version": "1.0.4",
++      "resolved": "https://registry.npmmirror.com/simple-yenc/-/simple-yenc-1.0.4.tgz",
++      "integrity": "sha512-5gvxpSd79e9a3V4QDYUqnqxeD4HGlhCakVpb6gMnDD7lexJggSBJRBO5h52y/iJrdXRilX9UCuDaIJhSWm5OWw==",
++      "license": "MIT",
++      "funding": {
++        "type": "individual",
++        "url": "https://github.com/sponsors/eshaz"
++      }
++    },
+     "node_modules/slash": {
+       "version": "5.1.0",
+       "resolved": "https://registry.npmjs.org/slash/-/slash-5.1.0.tgz",
+@@ -6799,6 +6932,20 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/synaudio": {
++      "version": "0.4.0",
++      "resolved": "https://registry.npmmirror.com/synaudio/-/synaudio-0.4.0.tgz",
++      "integrity": "sha512-7MuwmbEFhMAfm4o+dxe2mT/P1iT3wYIsKqSg13/FwwaKNA4FK6BBZf1DV4zzv93vxUCyDCTw1pJj11u4IXanEA==",
++      "license": "LGPL-3.0-or-later",
++      "dependencies": {
++        "@eshaz/web-worker": "1.2.2",
++        "simple-yenc": "^1.0.4"
++      },
++      "funding": {
++        "type": "individual",
++        "url": "https://github.com/sponsors/eshaz"
++      }
++    },
+     "node_modules/tinyexec": {
+       "version": "1.0.1",
+       "resolved": "https://registry.npmjs.org/tinyexec/-/tinyexec-1.0.1.tgz",
+diff --git a/package.json b/package.json
+index 014eb5116..edf1b0b3f 100644
+--- a/package.json
++++ b/package.json
+@@ -35,6 +35,7 @@
+     "codemirror-lang-liquidsoap": "^0.4",
+     "es-toolkit": "^1.39.10",
+     "hls.js": "^1.1.5",
++    "icecast-metadata-player": "^1.17.13",
+     "leaflet": "^1.7.1",
+     "leaflet-fullscreen": "^1.0.2",
+     "luxon": "^3",
+-- 
+2.50.1.windows.1
+
